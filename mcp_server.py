@@ -2,12 +2,17 @@ import sys
 import os
 import io
 import shutil
-
-_real_stdout = sys.stdout
-sys.stdout   = io.StringIO()   
+import asyncio
+import threading
 
 sys.stderr.reconfigure(encoding="utf-8")
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# ── Silence stdout immediately ────────────────────────────────────────────────
+# MCP uses stdout as its JSON-RPC channel. Anything printed to stdout
+# corrupts the connection. We redirect it now and restore after server init.
+_real_stdout = sys.stdout
+sys.stdout   = io.StringIO()
 
 from mcp.server.fastmcp import FastMCP
 from database import setup_database
@@ -17,39 +22,48 @@ from agents.rag_agent import upload_pdf, get_embeddings, get_vectorstore
 from agents.pdf_manager import list_pdfs, delete_pdf
 from config import PDF_DIR
 
-
+# ── DB setup (fast, does not block) ──────────────────────────────────────────
 setup_database()
 
-print("Pre-loading embedding model...", file=sys.stderr)
-get_embeddings()    # loads the sentence-transformer model into RAM
-get_vectorstore()   # connects LangChain to the ChromaDB collection
-print("Embedding model ready.", file=sys.stderr)
-
-print("Pre-loading graph...", file=sys.stderr)
-get_graph()
-print("Graph ready.", file=sys.stderr)
-
-# ── Restore stdout so MCP can use it ─────────────────────────
+# ── Restore stdout so MCP can start and respond to initialize immediately ─────
+# The embedding model loads BELOW in a background thread AFTER MCP has
+# already started. This is what prevents the 60-second startup timeout.
 sys.stdout = _real_stdout
 sys.stdout.reconfigure(encoding="utf-8")
 
-print("Server ready", file=sys.stderr)
-
 mcp = FastMCP("edu-assistant")
 
+# ── Background warm-up ────────────────────────────────────────────────────────
+# We load the embedding model and graph in a background thread so that:
+#   1. MCP can respond to initialize() immediately (no startup timeout)
+#   2. The model is ready before any real query arrives
+#
+# _warmup_done is an Event — tool handlers wait on it before doing any work.
+_warmup_done = threading.Event()
 
-# ══════════════════════════════════════════════════════════════
+def _warmup():
+    try:
+        print("Warming up embedding model...", file=sys.stderr)
+        get_embeddings()
+        get_vectorstore()
+        print("Embedding model ready.", file=sys.stderr)
+
+        print("Warming up graph...", file=sys.stderr)
+        get_graph()
+        print("Graph ready. Server fully operational.", file=sys.stderr)
+    except Exception as e:
+        print(f"Warm-up error: {e}", file=sys.stderr)
+    finally:
+        _warmup_done.set()   # always unblock tool handlers, even on error
+
+threading.Thread(target=_warmup, daemon=True).start()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  RESPONSE FORMATTER
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _format_response(final_state: dict) -> str:
-    """
-    Convert the graph's response dict into a readable string.
-
-    Only shows fields that are actually in the response.
-    For example, if a student asked only for attendance, we don't
-    print empty lines for Quiz Marks and Quiz Status.
-    """
     response = final_state.get("response", {})
     agent    = response.get("agent", "")
 
@@ -62,7 +76,6 @@ def _format_response(final_state: dict) -> str:
         if not data.get("success"):
             return data.get("message", "Student not found.")
 
-        # Teacher requested all students
         elif "students" in data:
             lines = ["All Students:\n"]
             for s in data["students"]:
@@ -75,17 +88,12 @@ def _format_response(final_state: dict) -> str:
                 )
             return "\n".join(lines)
 
-        # Single student — only show fields present in the response
         else:
             lines = []
-            if "name" in data:
-                lines.append(f"Name       : {data['name']}")
-            if "attendance" in data:
-                lines.append(f"Attendance : {data['attendance']}%")
-            if "quiz_marks" in data:
-                lines.append(f"Quiz Marks : {data['quiz_marks']}")
-            if "quiz_status" in data:
-                lines.append(f"Quiz Status: {data['quiz_status']}")
+            if "name"        in data: lines.append(f"Name       : {data['name']}")
+            if "attendance"  in data: lines.append(f"Attendance : {data['attendance']}%")
+            if "quiz_marks"  in data: lines.append(f"Quiz Marks : {data['quiz_marks']}")
+            if "quiz_status" in data: lines.append(f"Quiz Status: {data['quiz_status']}")
             return "\n".join(lines) if lines else "No data found."
 
     elif agent == "quiz":
@@ -94,9 +102,9 @@ def _format_response(final_state: dict) -> str:
     return "No response from the assistant."
 
 
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 #  MCP TOOLS
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 async def ask_chatbot(user_id: int, query: str) -> str:
@@ -117,6 +125,9 @@ async def ask_chatbot(user_id: int, query: str) -> str:
       user_id=3, query="generate a quiz on neural networks"
       user_id=1, query="generate a quiz on loops"  -> denied by RBAC
     """
+    # Wait for warm-up to finish (non-blocking — yields control to event loop)
+    await asyncio.to_thread(_warmup_done.wait)
+
     config = {"configurable": {"thread_id": str(user_id)}}
 
     initial_state = {
@@ -130,7 +141,12 @@ async def ask_chatbot(user_id: int, query: str) -> str:
     }
 
     try:
-        final_state = get_graph().invoke(initial_state, config=config)
+        # Run the entire graph in a worker thread.
+        # This keeps the asyncio event loop free to handle MCP heartbeats
+        # while embeddings / LLM calls run — preventing the 4-min timeout.
+        final_state = await asyncio.to_thread(
+            get_graph().invoke, initial_state, config
+        )
     except Exception as e:
         return f"Something went wrong: {str(e)}"
 
@@ -158,7 +174,6 @@ async def clear_memory(user_id: int) -> str:
         ]
         for key in keys_to_delete:
             del checkpointer.storage[key]
-
         return f"Conversation history cleared for user {user_id}."
     except Exception as e:
         print(f"  clear_memory warning: {e}", file=sys.stderr)
@@ -224,12 +239,14 @@ async def upload_pdf_from_path(user_id: int, file_path: str) -> str:
     filename  = os.path.basename(file_path)
     dest_path = os.path.join(PDF_DIR, filename)
 
-    # Copy file to the uploads folder if it's not already there
     if not os.path.exists(dest_path):
         shutil.copy2(file_path, dest_path)
 
+    # Wait for warm-up (embedding model must be ready before we can embed)
+    await asyncio.to_thread(_warmup_done.wait)
+
     print(f"  PDF UPLOAD by user_id={user_id}: '{filename}'", file=sys.stderr)
-    result = upload_pdf(dest_path)
+    result = await asyncio.to_thread(upload_pdf, dest_path)
 
     if not result["success"]:
         return f"Upload failed: {result['message']}"

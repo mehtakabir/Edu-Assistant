@@ -14,12 +14,12 @@ BASE_DIR           = os.path.dirname(os.path.abspath(__file__))
 DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'assistant.db')}"
 CHROMA_DIR         = os.path.join(BASE_DIR, "chroma_db")
 PDF_DIR            = os.path.join(BASE_DIR, "uploaded_pdfs")
-CASBIN_MODEL_PATH  = os.path.join(BASE_DIR, "rbac", "model.conf")   # ← fixed
-CASBIN_POLICY_PATH = os.path.join(BASE_DIR, "rbac", "policy.csv")   # ← fixed
+CASBIN_MODEL_PATH  = os.path.join(BASE_DIR, "rbac", "model.conf")   
+CASBIN_POLICY_PATH = os.path.join(BASE_DIR, "rbac", "policy.csv") 
 
 os.environ["LANGCHAIN_TRACING_V2"] = os.environ.get("LANGCHAIN_TRACING_V2", "false")
 os.environ["LANGCHAIN_API_KEY"]    = os.environ.get("LANGCHAIN_API_KEY", "")
-os.environ["LANGCHAIN_PROJECT"]    = os.environ.get("LANGCHAIN_PROJECT", "multi-agent")
+os.environ["LANGCHAIN_PROJECT"]    = os.environ.get("LANGCHAIN_PROJECT", "edu-assistant")
 
 _llm = None
 
