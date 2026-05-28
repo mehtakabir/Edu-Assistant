@@ -26,6 +26,14 @@ def get_embeddings():
     global _embeddings
     if _embeddings is None:
         print("Loading embedding model...", file=sys.stderr)
+        # After the first run the model is cached locally.
+        # Setting these env vars tells the HuggingFace Hub client to skip
+        # the ~20 HEAD requests it normally makes to check for updates —
+        # cutting cold-start time from ~4 minutes down to a few seconds.
+        # If the cache is missing (first-ever run) these are ignored and
+        # the model downloads normally.
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         _embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
         print("Embedding model loaded.", file=sys.stderr)
     return _embeddings

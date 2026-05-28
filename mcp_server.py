@@ -26,7 +26,10 @@ from config import PDF_DIR
 sys.stdout = _real_stdout
 sys.stdout.reconfigure(encoding="utf-8")
 
-setup_database()
+# setup_database() may print to stdout (e.g. "Database already set up.").
+# That would corrupt the MCP JSON-RPC channel, so we silence it here too.
+with redirect_stdout(io.StringIO()):
+    setup_database()
 print("Server ready", file=sys.stderr)
 
 mcp = FastMCP("edu-assistant")
