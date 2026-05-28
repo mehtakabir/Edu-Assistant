@@ -25,6 +25,10 @@ get_embeddings()    # loads the sentence-transformer model into RAM
 get_vectorstore()   # connects LangChain to the ChromaDB collection
 print("Embedding model ready.", file=sys.stderr)
 
+print("Pre-loading graph...", file=sys.stderr)
+get_graph()
+print("Graph ready.", file=sys.stderr)
+
 # ── Restore stdout so MCP can use it ─────────────────────────
 sys.stdout = _real_stdout
 sys.stdout.reconfigure(encoding="utf-8")
