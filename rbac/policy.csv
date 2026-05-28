@@ -1,0 +1,8 @@
+p, student, rag,     read
+p, teacher, rag,     read
+p, teacher, rag,     upload
+
+p, student, student, read
+p, teacher, student, read
+
+p, teacher, quiz,    generate
