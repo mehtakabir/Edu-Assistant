@@ -3,33 +3,32 @@ import os
 import io
 import shutil
 
-# ── Silence stdout during imports ────────────────────────────
-# MCP uses stdout as its communication channel (JSON-RPC over stdio).
-# Some libraries print to stdout when they load, which corrupts the
-# connection.  We redirect stdout to a dummy buffer during imports,
-# then restore it afterward.
 _real_stdout = sys.stdout
-sys.stdout   = io.StringIO()
+sys.stdout   = io.StringIO()   
 
 sys.stderr.reconfigure(encoding="utf-8")
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from contextlib import redirect_stdout
 from mcp.server.fastmcp import FastMCP
 from database import setup_database
 from graph import get_graph
 from agents.rbac_helper import check_permission
-from agents.rag_agent import upload_pdf
+from agents.rag_agent import upload_pdf, get_embeddings, get_vectorstore
 from agents.pdf_manager import list_pdfs, delete_pdf
 from config import PDF_DIR
 
+
+setup_database()
+
+print("Pre-loading embedding model...", file=sys.stderr)
+get_embeddings()    # loads the sentence-transformer model into RAM
+get_vectorstore()   # connects LangChain to the ChromaDB collection
+print("Embedding model ready.", file=sys.stderr)
+
+# ── Restore stdout so MCP can use it ─────────────────────────
 sys.stdout = _real_stdout
 sys.stdout.reconfigure(encoding="utf-8")
 
-# setup_database() may print to stdout (e.g. "Database already set up.").
-# That would corrupt the MCP JSON-RPC channel, so we silence it here too.
-with redirect_stdout(io.StringIO()):
-    setup_database()
 print("Server ready", file=sys.stderr)
 
 mcp = FastMCP("edu-assistant")
@@ -43,12 +42,9 @@ def _format_response(final_state: dict) -> str:
     """
     Convert the graph's response dict into a readable string.
 
-    FIX: We now check whether each field exists before printing it.
-    Before, it always printed all 4 fields — so when a student asked
-    only for attendance, they'd see:
-        Quiz Marks :
-        Quiz Status:
-    Now it only shows fields that are actually in the response.
+    Only shows fields that are actually in the response.
+    For example, if a student asked only for attendance, we don't
+    print empty lines for Quiz Marks and Quiz Status.
     """
     response = final_state.get("response", {})
     agent    = response.get("agent", "")
@@ -75,7 +71,7 @@ def _format_response(final_state: dict) -> str:
                 )
             return "\n".join(lines)
 
-        # Single student — only show fields that are present in the response
+        # Single student — only show fields present in the response
         else:
             lines = []
             if "name" in data:
@@ -115,11 +111,8 @@ async def ask_chatbot(user_id: int, query: str) -> str:
       user_id=1, query="show my attendance"
       user_id=3, query="show attendance of Nakul"
       user_id=3, query="generate a quiz on neural networks"
-      user_id=1, query="generate a quiz on loops"  → denied by RBAC
+      user_id=1, query="generate a quiz on loops"  -> denied by RBAC
     """
-    # Each user gets their own conversation thread.
-    # LangGraph loads the last checkpoint before running and saves
-    # a new one after — so follow-up questions remember earlier ones.
     config = {"configurable": {"thread_id": str(user_id)}}
 
     initial_state = {
@@ -151,15 +144,10 @@ async def clear_memory(user_id: int) -> str:
 
     user_id: 1=Nakul, 2=Aslam, 3=Kabir
     """
-    # FIX: Directly delete the checkpoint from InMemorySaver's storage.
-    # The old approach (invoking the graph with a dummy state) did NOT
-    # actually clear memory — it just added a new checkpoint on top.
     checkpointer = get_graph().checkpointer
     thread_id    = str(user_id)
 
     try:
-        # InMemorySaver stores checkpoints in a dict keyed by thread config.
-        # We clear all entries for this user's thread.
         keys_to_delete = [
             key for key in checkpointer.storage
             if isinstance(key, tuple) and thread_id in str(key)
@@ -169,8 +157,6 @@ async def clear_memory(user_id: int) -> str:
 
         return f"Conversation history cleared for user {user_id}."
     except Exception as e:
-        # Even if something goes wrong, tell the user it's cleared
-        # (the next conversation will start fresh anyway)
         print(f"  clear_memory warning: {e}", file=sys.stderr)
         return f"Conversation history cleared for user {user_id}."
 
@@ -193,7 +179,7 @@ async def list_uploaded_pdfs(user_id: int) -> str:
 
     lines = [f"Uploaded PDFs ({result['total']} total):\n"]
     for pdf in result["pdfs"]:
-        lines.append(f"  • {pdf['filename']:<35} ({pdf['chunks']} chunks)")
+        lines.append(f"  * {pdf['filename']:<35} ({pdf['chunks']} chunks)")
     return "\n".join(lines)
 
 

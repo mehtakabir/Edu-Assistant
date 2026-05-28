@@ -8,14 +8,15 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
 from config import get_llm, CHROMA_DIR
+
+
 
 COLLECTION_NAME = "edu_documents"
 EMBED_MODEL     = "sentence-transformers/all-mpnet-base-v2"
 
-# Cached clients — created once, reused on every call
+# Cached objects — created once, reused on every call
 _chroma_client  = None
 _raw_collection = None
 _vectorstore    = None
@@ -23,63 +24,75 @@ _embeddings     = None
 
 
 def get_embeddings():
+    """Load the HuggingFace embedding model (only once)."""
     global _embeddings
     if _embeddings is None:
         print("Loading embedding model...", file=sys.stderr)
-        # After the first run the model is cached locally.
-        # Setting these env vars tells the HuggingFace Hub client to skip
-        # the ~20 HEAD requests it normally makes to check for updates —
-        # cutting cold-start time from ~4 minutes down to a few seconds.
-        # If the cache is missing (first-ever run) these are ignored and
-        # the model downloads normally.
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         _embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
         print("Embedding model loaded.", file=sys.stderr)
     return _embeddings
 
 
 def get_chroma_client():
+    """Get (or create) the persistent ChromaDB client."""
     global _chroma_client
     if _chroma_client is None:
         _chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
     return _chroma_client
 
 
-
 def get_raw_collection():
+    """
+    Get the ChromaDB collection WITHOUT registering an embedding function.
+
+    Passing embedding_function=None tells ChromaDB:
+    'I will handle embeddings myself, don't touch them.'
+    This avoids the conflict error completely.
+    """
     global _raw_collection
     if _raw_collection is None:
         _raw_collection = get_chroma_client().get_or_create_collection(
-            name               = COLLECTION_NAME,
-            embedding_function = SentenceTransformerEmbeddingFunction(model_name="all-mpnet-base-v2")
+            name=COLLECTION_NAME
+            # No embedding_function here — this is the fix!
         )
     return _raw_collection
 
 
 def get_vectorstore():
+    """
+    Get the LangChain Chroma vectorstore (used for similarity search).
+    This uses HuggingFaceEmbeddings — same model as before, just one wrapper.
+    """
     global _vectorstore
     if _vectorstore is None:
         _vectorstore = Chroma(
-            client             = get_chroma_client(),   # reuse same client
-            collection_name    = COLLECTION_NAME,
-            embedding_function = get_embeddings()
+            client=get_chroma_client(),
+            collection_name=COLLECTION_NAME,
+            embedding_function=get_embeddings()
         )
     return _vectorstore
 
 
 def is_store_empty() -> bool:
+    """Returns True if no documents have been uploaded yet."""
     return get_raw_collection().count() == 0
 
 
 def is_pdf_already_uploaded(filename: str) -> bool:
+    """Check if a PDF with this filename is already in the database."""
     results = get_raw_collection().get(where={"source_file": filename})
     return len(results["ids"]) > 0
 
 
 def upload_pdf(pdf_path: str) -> dict:
+    """
+    Upload a PDF file: read it, split into chunks, embed and store in ChromaDB.
+
+    Returns a dict with success/failure info.
+    """
     filename = os.path.basename(pdf_path)
 
+    # Don't upload the same file twice
     if is_pdf_already_uploaded(filename):
         return {
             "success": False,
@@ -87,6 +100,7 @@ def upload_pdf(pdf_path: str) -> dict:
             "message": f"'{filename}' is already uploaded."
         }
 
+    # Read the PDF
     try:
         loader = PyPDFLoader(pdf_path)
         pages  = loader.load()
@@ -104,10 +118,11 @@ def upload_pdf(pdf_path: str) -> dict:
             "message": f"'{filename}' has no readable text."
         }
 
+    # Split into small chunks so search works well
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size    = 800,
-        chunk_overlap = 150,
-        separators    = ["\n\n", "\n", ".", " ", ""]
+        chunk_size=800,
+        chunk_overlap=150,
+        separators=["\n\n", "\n", ".", " ", ""]
     )
     chunks = splitter.split_documents(pages)
 
@@ -118,15 +133,28 @@ def upload_pdf(pdf_path: str) -> dict:
             "message": f"Could not split '{filename}' into chunks."
         }
 
+    # Tag each chunk with the source filename
     for chunk in chunks:
         chunk.metadata["source_file"] = filename
 
+    # Embed the chunks using our HuggingFace model
     try:
+        embeddings_model = get_embeddings()
+        texts      = [chunk.page_content for chunk in chunks]
+        embeddings = embeddings_model.embed_documents(texts)   # list of vectors
+
         collection = get_raw_collection()
         collection.add(
-            documents = [chunk.page_content for chunk in chunks],
-            ids       = [f"{filename}_chunk_{i}" for i in range(len(chunks))],
-            metadatas = [{"source_file": filename, "page": chunk.metadata.get("page", 0)} for chunk in chunks]
+            documents=texts,
+            embeddings=embeddings,   # we provide embeddings ourselves
+            ids=[f"{filename}_chunk_{i}" for i in range(len(chunks))],
+            metadatas=[
+                {
+                    "source_file": filename,
+                    "page": chunk.metadata.get("page", 0)
+                }
+                for chunk in chunks
+            ]
         )
     except Exception as e:
         return {
@@ -144,23 +172,25 @@ def upload_pdf(pdf_path: str) -> dict:
 
 
 def get_context_for_topic(topic: str) -> str:
+    """Search the vectorstore for content related to a topic."""
     if is_store_empty():
         return ""
     retriever = get_vectorstore().as_retriever(
-        search_type   = "mmr",
-        search_kwargs = {"k": 4, "fetch_k": 20, "lambda_mult": 0.8}
+        search_type="mmr",
+        search_kwargs={"k": 4, "fetch_k": 20, "lambda_mult": 0.8}
     )
     docs = retriever.invoke(topic)
     return "\n\n".join(doc.page_content for doc in docs)
 
 
 def run_rag_agent(query: str) -> str:
+    """Answer a student's question using the uploaded PDF notes."""
     if is_store_empty():
         return "No study materials uploaded yet. Please upload PDF notes first."
 
     retriever = get_vectorstore().as_retriever(
-        search_type   = "mmr",
-        search_kwargs = {"k": 4, "fetch_k": 20, "lambda_mult": 0.8}
+        search_type="mmr",
+        search_kwargs={"k": 4, "fetch_k": 20, "lambda_mult": 0.8}
     )
 
     prompt = ChatPromptTemplate.from_messages([
