@@ -1,27 +1,14 @@
-"""
-agents/pdf_manager.py
-─────────────────────
-PDF management agent — list and delete uploaded PDFs.
-Complements the existing upload_pdf() in agents/rag_agent.py.
-
-Drop this file into your agents/ folder.
-No changes needed to any existing file.
-"""
-
 import os
 import sys
 from agents.rag_agent import get_raw_collection
 from config import PDF_DIR
 
 
-# ─── List ─────────────────────────────────────────────────────
-
 def list_pdfs() -> dict:
     """
-    Returns all PDFs currently indexed in ChromaDB,
-    along with how many chunks each one contributed.
+    Returns all PDFs currently in ChromaDB and how many chunks each has.
 
-    Returns:
+    Example return value:
         {
             "success": True,
             "total":   2,
@@ -38,7 +25,7 @@ def list_pdfs() -> dict:
         if not results["ids"]:
             return {"success": True, "pdfs": [], "total": 0}
 
-        # Count how many chunks belong to each source file
+        # Count how many chunks belong to each PDF file
         chunk_counts: dict[str, int] = {}
         for meta in results["metadatas"]:
             fname = meta.get("source_file", "unknown")
@@ -56,23 +43,21 @@ def list_pdfs() -> dict:
         return {"success": False, "message": f"Failed to list PDFs: {str(e)}"}
 
 
-# ─── Delete ───────────────────────────────────────────────────
-
 def delete_pdf(filename: str) -> dict:
     """
-    Deletes a PDF from ChromaDB (all its chunks) and from disk.
+    Deletes a PDF from ChromaDB (removes all its chunks) and from disk.
 
     Args:
-        filename: the bare filename, e.g. "chapter1.pdf"
-                  (NOT a full path)
+        filename: just the filename, e.g. "chapter1.pdf"
+                  (not a full path)
 
     Returns on success:
         {
-            "success":       True,
-            "filename":      "chapter1.pdf",
+            "success":        True,
+            "filename":       "chapter1.pdf",
             "chunks_removed": 42,
             "disk_deleted":   True,
-            "message":       "..."
+            "message":        "..."
         }
 
     Returns on failure:
@@ -85,7 +70,7 @@ def delete_pdf(filename: str) -> dict:
     try:
         collection = get_raw_collection()
 
-        # ── 1. Confirm the file exists in the vector store
+        # Check the file actually exists in the knowledge base
         existing = collection.get(where={"source_file": filename})
         if not existing["ids"]:
             return {
@@ -97,11 +82,11 @@ def delete_pdf(filename: str) -> dict:
         chunk_count = len(existing["ids"])
         print(f"  Deleting '{filename}' — {chunk_count} chunks", file=sys.stderr)
 
-        # ── 2. Remove all chunks from ChromaDB
+        # Remove all chunks from ChromaDB
         collection.delete(where={"source_file": filename})
         print(f"  ChromaDB: chunks removed", file=sys.stderr)
 
-        # ── 3. Remove the file from disk (best-effort)
+        # Also remove the file from disk (best-effort — won't crash if missing)
         disk_deleted = False
         file_path    = os.path.join(PDF_DIR, filename)
         if os.path.exists(file_path):

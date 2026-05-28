@@ -15,4 +15,4 @@ boto3
 pydantic
 python-dotenv
 langchain-huggingface    
-langchain-chroma         
+langchain-chroma

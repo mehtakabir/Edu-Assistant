@@ -22,6 +22,11 @@ from agents.student_info_agent import (
 )
 
 
+# ─── State definition ─────────────────────────────────────────
+# Every field here is shared across all nodes in the graph.
+# 'messages' uses add_messages so LangGraph APPENDS new messages
+# instead of replacing the whole list.
+
 class State(TypedDict):
     user_id:  int
     role:     str
@@ -29,17 +34,24 @@ class State(TypedDict):
     intent:   str
     response: dict
     error:    str
-    messages: Annotated[list, add_messages]   # ← LangGraph appends to this automatically
+    messages: Annotated[list, add_messages]
 
 
-# ─── Helpers ──────────────────────────────────────────────────
+# ─── Helper functions ─────────────────────────────────────────
 
 def extract_student_id(query: str):
-    match = re.search(r'\b(\d+)\b', query)
+    """
+    Extract a student ID only when the query clearly mentions one.
+    Matches patterns like: 'student 2', 'id 2', 'id=2', 'student id 2'
+    This avoids false matches on queries like 'top 5 students'.
+    """
+    # Look for 'id' or 'student' followed by a number
+    match = re.search(r'\b(?:student\s+id|student|id)\s*[=:]?\s*(\d+)\b', query, re.IGNORECASE)
     return int(match.group(1)) if match else None
 
 
 def extract_student_name(query: str, known_names: list):
+    """Check if any known student name appears in the query."""
     query_lower = query.lower()
     for name in known_names:
         if name.lower() in query_lower:
@@ -48,10 +60,14 @@ def extract_student_name(query: str, known_names: list):
 
 
 def extract_requested_field(query: str) -> str:
+    """
+    Figure out which data field the user is asking about.
+    Returns: 'attendance', 'quiz_status', 'quiz_marks', or 'all'
+    """
     query_lower = query.lower()
     if any(w in query_lower for w in ["attendance", "present", "absent"]):
         return "attendance"
-    elif any(w in query_lower for w in ["quiz status", "status"]):
+    elif "quiz status" in query_lower or "status" in query_lower:
         return "quiz_status"
     elif any(w in query_lower for w in ["quiz mark", "quiz score", "marks", "score", "result"]):
         return "quiz_marks"
@@ -59,9 +75,12 @@ def extract_requested_field(query: str) -> str:
         return "all"
 
 
-# ─── Nodes ────────────────────────────────────────────────────
+# ─── Graph nodes ──────────────────────────────────────────────
+# Each node receives the current state, does its work, and
+# returns the updated state (only the fields it changed).
 
 def node_rbac(state: State) -> State:
+    """Step 1: Look up the user's role from the database."""
     print(f"\n{'─'*50}", file=sys.stderr)
     print(f"  User     : {state['user_id']}", file=sys.stderr)
     print(f"  Query    : {state['query']}", file=sys.stderr)
@@ -76,6 +95,7 @@ def node_rbac(state: State) -> State:
 
 
 def node_router(state: State) -> State:
+    """Step 2: Decide which agent should handle this query."""
     if state.get("error"):
         return state
     state["intent"] = run_router_agent(state["query"])
@@ -84,6 +104,7 @@ def node_router(state: State) -> State:
 
 
 def node_rag(state: State) -> State:
+    """Step 3a: Answer a question from the uploaded PDF notes."""
     print(f"  Agent    : RAG AGENT", file=sys.stderr)
 
     if not check_permission_by_role(state["role"], "rag", "read"):
@@ -96,7 +117,8 @@ def node_rag(state: State) -> State:
     answer = run_rag_agent(state["query"])
     state["response"] = {"agent": "rag", "answer": answer}
 
-    # ── Append to LangGraph message history ──
+    # FIX: Return new messages as a list — LangGraph's add_messages
+    # reducer will APPEND these to the existing history automatically.
     state["messages"] = [
         HumanMessage(content=state["query"]),
         AIMessage(content=answer),
@@ -110,6 +132,7 @@ def node_rag(state: State) -> State:
 
 
 def node_student(state: State) -> State:
+    """Step 3b: Fetch student information (attendance, marks, etc.)."""
     print(f"  Agent    : STUDENT AGENT", file=sys.stderr)
 
     if not check_permission_by_role(state["role"], "student", "read"):
@@ -119,6 +142,7 @@ def node_student(state: State) -> State:
 
     field = extract_requested_field(state["query"])
 
+    # ── Student accessing their own data ──
     if state["role"] == "student":
         known_names = get_all_student_names()
         own_info    = get_student_info(state["user_id"], "all")
@@ -126,6 +150,7 @@ def node_student(state: State) -> State:
         asked_name  = extract_student_name(state["query"], known_names)
         asked_id    = extract_student_id(state["query"])
 
+        # Block students from viewing other students' data
         if asked_name and asked_name.lower() != own_name:
             state["error"] = f"Access denied. You are not allowed to view {asked_name}'s data."
             print(f"  Status   : DENIED — tried to access {asked_name}'s data", file=sys.stderr)
@@ -141,7 +166,6 @@ def node_student(state: State) -> State:
         result = get_student_info(state["user_id"], field)
         state["response"] = {"agent": "student", "data": result}
 
-        # ── Append to LangGraph message history ──
         summary = f"Student data fetched: {result}"
         state["messages"] = [
             HumanMessage(content=state["query"]),
@@ -156,6 +180,7 @@ def node_student(state: State) -> State:
         print(f"  {'─'*30}", file=sys.stderr)
         return state
 
+    # ── Teacher accessing any student's data ──
     known_names = get_all_student_names()
     name        = extract_student_name(state["query"], known_names)
     student_id  = extract_student_id(state["query"])
@@ -174,7 +199,6 @@ def node_student(state: State) -> State:
 
     state["response"] = {"agent": "student", "data": result}
 
-    # ── Append to LangGraph message history ──
     summary = f"Student data fetched: {result}"
     state["messages"] = [
         HumanMessage(content=state["query"]),
@@ -197,6 +221,7 @@ def node_student(state: State) -> State:
 
 
 def node_quiz(state: State) -> State:
+    """Step 3c: Generate a quiz on a topic (teachers only)."""
     print(f"  Agent    : QUIZ AGENT", file=sys.stderr)
 
     if not check_permission_by_role(state["role"], "quiz", "generate"):
@@ -209,7 +234,6 @@ def node_quiz(state: State) -> State:
     result = generate_quiz(state["query"])
     state["response"] = {"agent": "quiz", "quiz": result}
 
-    # ── Append to LangGraph message history ──
     state["messages"] = [
         HumanMessage(content=state["query"]),
         AIMessage(content=result),
@@ -222,9 +246,10 @@ def node_quiz(state: State) -> State:
     return state
 
 
-# ─── Routing ──────────────────────────────────────────────────
+# ─── Routing logic ────────────────────────────────────────────
 
 def decide_next_node(state: State) -> str:
+    """After routing, pick which agent node to run."""
     if state.get("error"):
         return END
     intent = state.get("intent", "rag_query")
@@ -236,23 +261,24 @@ def decide_next_node(state: State) -> str:
         return "rag"
 
 
-# ─── Graph builder ────────────────────────────────────────────
+# ─── Build the graph ──────────────────────────────────────────
 
-# SqliteSaver persists full State snapshots to a local SQLite file,
-# keyed by thread_id. Conversation history survives server restarts.
-# The checkpoints.db file is created automatically on first run.
+# InMemorySaver stores conversation history while the server is running.
+# History is lost when the server restarts (that's fine for development).
 _checkpointer = InMemorySaver()
 
 
 def _build_graph():
     graph = StateGraph(State)
 
+    # Add all nodes
     graph.add_node("rbac",    node_rbac)
     graph.add_node("router",  node_router)
     graph.add_node("rag",     node_rag)
     graph.add_node("student", node_student)
     graph.add_node("quiz",    node_quiz)
 
+    # Define the flow
     graph.set_entry_point("rbac")
     graph.add_edge("rbac", "router")
     graph.add_conditional_edges(
@@ -264,7 +290,6 @@ def _build_graph():
     graph.add_edge("student", END)
     graph.add_edge("quiz",    END)
 
-    # ← compile with checkpointer — this is what enables memory
     return graph.compile(checkpointer=_checkpointer)
 
 

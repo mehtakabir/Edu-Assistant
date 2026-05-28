@@ -7,6 +7,10 @@ router = APIRouter(tags=["Query"])
 
 @router.post("/query")
 def query(request: QueryRequest):
+    # Each user gets their own conversation thread.
+    # This is the same pattern used in mcp_server.py.
+    config = {"configurable": {"thread_id": str(request.user_id)}}
+
     initial_state = {
         "user_id":  request.user_id,
         "role":     "",
@@ -14,9 +18,10 @@ def query(request: QueryRequest):
         "intent":   "",
         "response": {},
         "error":    "",
+        "messages": [],
     }
 
-    final_state = get_graph().invoke(initial_state)
+    final_state = get_graph().invoke(initial_state, config=config)
 
     if final_state.get("error"):
         raise HTTPException(status_code=403, detail=final_state["error"])

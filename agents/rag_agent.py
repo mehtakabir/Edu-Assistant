@@ -8,6 +8,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
+from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
 from config import get_llm, CHROMA_DIR
 
@@ -37,18 +38,13 @@ def get_chroma_client():
     return _chroma_client
 
 
+
 def get_raw_collection():
     global _raw_collection
     if _raw_collection is None:
-        # Use a simple lambda wrapper around the already-cached HuggingFaceEmbeddings
-        # so ChromaDB doesn't load a second model instance
-        class _EmbFn(chromadb.EmbeddingFunction):
-            def __call__(self, input):
-                return get_embeddings().embed_documents(input)
-
         _raw_collection = get_chroma_client().get_or_create_collection(
             name               = COLLECTION_NAME,
-            embedding_function = _EmbFn()
+            embedding_function = SentenceTransformerEmbeddingFunction(model_name="all-mpnet-base-v2")
         )
     return _raw_collection
 
